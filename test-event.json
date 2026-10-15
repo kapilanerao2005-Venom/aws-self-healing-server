@@ -1,0 +1,7 @@
+{
+  "detail": {
+    "alarmName": "manual-smoke-test",
+    "state": {"value": "ALARM"},
+    "previousState": {"value": "OK"}
+  }
+}

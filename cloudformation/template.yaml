@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Self-Healing Server - automated incident response (EC2 + CloudWatch + EventBridge + Lambda + SNS)
+
+Parameters:
+  OperatorEmail:
+    Type: String
+    Description: Email address that receives recovery alerts
+
+Resources:
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: self-heal-alerts-cfn
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref OperatorEmail
+
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: self-heal-sg-cfn
+      GroupDescription: HTTP only for the demo web server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn: EC2InstanceProfile
+    Properties:
+      ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt WebSG.GroupId
+      Tags:
+        - Key: Name
+          Value: self-heal-demo-cfn
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y
+          dnf install -y httpd
+          systemctl enable --now httpd
+          echo "<h1>Self-Healing Server</h1><p>Status: ALIVE</p><p>Deployed via CloudFormation.</p>" > /var/www/html/index.html
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: self-heal-remediation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: AllowRemediation
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:CreateSnapshot
+                  - ec2:CreateTags
+                  - ec2:DeleteSnapshot
+                  - ec2:RebootInstances
+                Resource: "*"
+              - Sid: AllowNotification
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopic
+
+  SelfHealBot:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: self-heal-bot-cfn
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref WebServer
+          TOPIC_ARN: !Ref AlertsTopic
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          ec2 = boto3.client("ec2")
+          sns = boto3.client("sns")
+
+          INSTANCE_ID = os.environ["INSTANCE_ID"]
+          TOPIC_ARN = os.environ["TOPIC_ARN"]
+          KEEP_SNAPSHOTS = int(os.environ.get("KEEP_SNAPSHOTS", "5"))
+
+          def lambda_handler(event, context):
+              detail = event.get("detail", {})
+              alarm_name = detail.get("alarmName", "unknown-alarm")
+              state = detail.get("state", {}).get("value", "UNKNOWN")
+              previous_state = detail.get("previousState", {}).get("value", "UNKNOWN")
+              print(f"Alarm {alarm_name} changed {previous_state} -> {state}")
+
+              volumes = ec2.describe_volumes(
+                  Filters=[{"Name": "attachment.instance-id", "Values": [INSTANCE_ID]}]
+              ).get("Volumes", [])
+
+              snapshot_ids = []
+              for vol in volumes:
+                  snap = ec2.create_snapshot(
+                      VolumeId=vol["VolumeId"],
+                      Description=f"Self-heal snapshot before reboot (trigger: {alarm_name})",
+                      TagSpecifications=[{
+                          "ResourceType": "snapshot",
+                          "Tags": [{"Key": "AutoSnapshot", "Value": "true"}]
+                      }],
+                  )
+                  snapshot_ids.append(snap["SnapshotId"])
+                  print(f"Created snapshot {snap['SnapshotId']} of volume {vol['VolumeId']}")
+
+              ec2.reboot_instances(InstanceIds=[INSTANCE_ID])
+              print(f"Rebooted instance {INSTANCE_ID}")
+
+              snaps = ec2.describe_snapshots(
+                  Filters=[{"Name": "tag:AutoSnapshot", "Values": ["true"]}],
+                  OwnerIds=["self"],
+              ).get("Snapshots", [])
+              snaps.sort(key=lambda s: s["StartTime"], reverse=True)
+              for old in snaps[KEEP_SNAPSHOTS:]:
+                  ec2.delete_snapshot(SnapshotId=old["SnapshotId"])
+                  print(f"Deleted old snapshot {old['SnapshotId']} (cost hygiene)")
+
+              message = (
+                  "AUTOMATED RECOVERY EXECUTED\n"
+                  f"Alarm: {alarm_name}\n"
+                  f"State: {previous_state} -> {state}\n"
+                  f"Instance: {INSTANCE_ID}\n"
+                  f"Snapshots taken: {', '.join(snapshot_ids) or 'none'}\n"
+                  "Action: instance rebooted\n"
+              )
+              sns.publish(
+                  TopicArn=TOPIC_ARN,
+                  Subject="[Self-Healing Bot] Recovery executed",
+                  Message=message,
+              )
+              print("Notification sent")
+              return {"statusCode": 200, "body": message}
+
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: self-heal-high-cpu-cfn
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WebServer
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+
+  AlarmToLambdaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: self-heal-alarm-to-lambda-cfn
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - !Ref HighCpuAlarm
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: "1"
+          Arn: !GetAtt SelfHealBot.Arn
+
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SelfHealBot
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmToLambdaRule.Arn
+
+Outputs:
+  WebsiteURL:
+    Description: Open this URL in a browser
+    Value: !Sub "http://${WebServer.PublicIp}"
+  InstanceId:
+    Description: The self-healing EC2 instance
+    Value: !Ref WebServer
+  AlarmName:
+    Description: The CPU alarm wired to the Lambda bot
+    Value: !Ref HighCpuAlarm
